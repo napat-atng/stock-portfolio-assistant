@@ -24,7 +24,7 @@ function setCache(key, data, ttlSeconds) {
   cache.set(key, { data, expiresAt: Date.now() + ttlSeconds * 1000 });
 }
 
-const TTL = { quote: 60, history: 600, search: 300 };
+const TTL = { quote: 60, history: 600, search: 300, exchangeRate: 3600 };
 
 // ─── Throttle: max 8 req/min → 1 req ทุก 7.5 วินาที ─────────────────────────
 let lastRequestTime = 0;
@@ -46,6 +46,35 @@ async function tdFetch(path, params = {}) {
   if (data.status === 'error') throw new Error(data.message || 'Twelve Data error');
   return data;
 }
+
+// ─── GET /api/exchange-rate ───────────────────────────────────────────────────
+// ดึงอัตราแลกเปลี่ยน USD/THB จาก open.er-api.com (ฟรี ไม่ต้อง key)
+app.get('/api/exchange-rate', async (req, res) => {
+  try {
+    const cached = getCache('exchange-rate:USDTHB');
+    if (cached) return res.json(cached);
+
+    const response = await fetch('https://open.er-api.com/v6/latest/USD');
+    if (!response.ok) throw new Error(`Exchange rate HTTP ${response.status}`);
+    const data = await response.json();
+
+    if (data.result !== 'success') throw new Error('Exchange rate API error');
+
+    const result = {
+      rate: data.rates.THB,
+      base: 'USD',
+      target: 'THB',
+      updatedAt: data.time_last_update_utc,
+    };
+
+    setCache('exchange-rate:USDTHB', result, TTL.exchangeRate);
+    res.json(result);
+  } catch (error) {
+    console.error('[exchange-rate]', error.message);
+    // Fallback rate หากดึงไม่ได้
+    res.json({ rate: 34.5, base: 'USD', target: 'THB', updatedAt: null, fallback: true });
+  }
+});
 
 // ─── GET /api/quote/:symbol ───────────────────────────────────────────────────
 app.get('/api/quote/:symbol', async (req, res) => {
@@ -89,7 +118,6 @@ app.post('/api/quotes', async (req, res) => {
       return res.status(400).json({ error: 'symbols must be an array' });
     }
 
-    // แยก cached vs toFetch
     const results = [];
     const toFetch = [];
     for (const s of symbols) {
@@ -99,7 +127,6 @@ app.post('/api/quotes', async (req, res) => {
       else toFetch.push(sym);
     }
 
-    // Twelve Data รองรับ batch query หลาย symbol ในครั้งเดียว (คั่นด้วย comma)
     if (toFetch.length > 0) {
       const now = Date.now();
       const wait = 7500 - (now - lastRequestTime);
@@ -113,7 +140,6 @@ app.post('/api/quotes', async (req, res) => {
       const res2 = await fetch(url.toString());
       const raw = await res2.json();
 
-      // ถ้า symbol เดียวจะได้ object, หลายตัวจะได้ { SYM: {...}, ... }
       const entries = toFetch.length === 1
         ? { [toFetch[0]]: raw }
         : raw;
@@ -158,7 +184,6 @@ app.get('/api/history/:symbol', async (req, res) => {
     const cached = getCache(cacheKey);
     if (cached) return res.json(cached);
 
-    // คำนวณ start_date
     const end = new Date();
     const start = new Date();
     switch (period) {
